@@ -27,7 +27,7 @@ SETTINGS_PATH = BASE_DIR / "config" / "settings.json"
 STATE_PATH = BASE_DIR / "data" / "state.json"
 
 IOS_UPDATES_URL = "https://support.apple.com/en-us/123075"
-
+APPLE_SECURITY_RELEASES_URL = "https://support.apple.com/en-us/100100"
 
 def fetch_ios_updates_page() -> dict:
     response = requests.get(IOS_UPDATES_URL, timeout=20)
@@ -35,6 +35,16 @@ def fetch_ios_updates_page() -> dict:
 
     return {
         "url": IOS_UPDATES_URL,
+        "status_code": response.status_code,
+        "html": response.text,
+    }
+
+def fetch_apple_security_releases_page() -> dict:
+    response = requests.get(APPLE_SECURITY_RELEASES_URL, timeout=20)
+    response.raise_for_status()
+
+    return {
+        "url": APPLE_SECURITY_RELEASES_URL,
         "status_code": response.status_code,
         "html": response.text,
     }
@@ -95,178 +105,192 @@ def main() -> None:
     print(f"state:    {STATE_PATH}")
     print()
 
+    webhook_url = settings["notification"]["discord_webhook_url"].strip()
+
     print("[windows]")
     print(settings["windows"])
     print()
 
-    windows_result = fetch_windows_release_health()
-    html = windows_result["html"]
-    current_snapshot = build_windows_snapshot(html)
-
-    previous_snapshot = state.get("windows", {}).get("release_health", {})
-
-    print("current windows page title:")
-    print(current_snapshot["title"])
-    print()
-
-    added_versions = get_added_items(
-        previous_snapshot.get("versions", []),
-        current_snapshot["versions"]
-    )
-    added_message_center = get_added_items(
-        previous_snapshot.get("message_center", []),
-        current_snapshot["message_center"]
-    )
-
-    has_previous_snapshot = bool(previous_snapshot)
-    has_new_items = bool(added_versions or added_message_center)
-    should_notify = (not has_previous_snapshot) or has_new_items
-
-    if not has_previous_snapshot:
-        print("previous snapshot: none")
-        print("result: first save")
+    if not settings.get("windows", {}).get("enabled", True):
+        print("windows check: skipped (disabled)")
+        print()
     else:
-        print("previous snapshot: found")
-        if not has_new_items:
-            print("result: no new items")
+        windows_result = fetch_windows_release_health()
+        html = windows_result["html"]
+        current_snapshot = build_windows_snapshot(html)
+
+        previous_snapshot = state.get("windows", {}).get("release_health", {})
+
+        print("current windows page title:")
+        print(current_snapshot["title"])
+        print()
+
+        added_versions = get_added_items(
+            previous_snapshot.get("versions", []),
+            current_snapshot["versions"]
+        )
+        added_message_center = get_added_items(
+            previous_snapshot.get("message_center", []),
+            current_snapshot["message_center"]
+        )
+
+        has_previous_snapshot = bool(previous_snapshot)
+        has_new_items = bool(added_versions or added_message_center)
+        should_notify = (not has_previous_snapshot) or has_new_items
+
+        if not has_previous_snapshot:
+            print("previous snapshot: none")
+            print("result: first save")
         else:
-            print("result: new items found")
-    print()
+            print("previous snapshot: found")
+            if not has_new_items:
+                print("result: no new items")
+            else:
+                print("result: new items found")
+        print()
 
-    print("new versions:")
-    if added_versions:
-        for version in added_versions:
-            print(f"- {version}")
-    else:
-        print("- none")
-    print()
+        print("new versions:")
+        if added_versions:
+            for version in added_versions:
+                print(f"- {version}")
+        else:
+            print("- none")
+        print()
 
-    print("new message center items:")
-    if added_message_center:
-        for item in added_message_center:
-            print(f"- {item}")
-    else:
-        print("- none")
-    print()
+        print("new message center items:")
+        if added_message_center:
+            for item in added_message_center:
+                print(f"- {item}")
+        else:
+            print("- none")
+        print()
 
-    evaluation = evaluate_windows_release_health(current_snapshot["message_center"])
+        evaluation = evaluate_windows_release_health(current_snapshot["message_center"])
 
-    print("windows evaluation:")
-    print(f"verdict: {evaluation['verdict']}")
-    print("reasons:")
-    for reason in evaluation["reasons"]:
-        print(f"- {reason}")
-    print()
+        print("windows evaluation:")
+        print(f"verdict: {evaluation['verdict']}")
+        print("reasons:")
+        for reason in evaluation["reasons"]:
+            print(f"- {reason}")
+        print()
 
-    message = build_windows_message(current_snapshot, evaluation)
-    print("notification preview:")
-    print(message)
-    print()
+        message = build_windows_message(current_snapshot, evaluation)
+        print("notification preview:")
+        print(message)
+        print()
 
-    webhook_url = settings["notification"]["discord_webhook_url"].strip()
+        if webhook_url and should_notify:
+            send_discord_message(webhook_url, message)
+            print("discord notification: sent")
+        elif webhook_url and not should_notify:
+            print("discord notification: skipped (no new items)")
+        else:
+            print("discord notification: skipped (webhook url is empty)")
 
-    if webhook_url and should_notify:
-        send_discord_message(webhook_url, message)
-        print("discord notification: sent")
-    elif webhook_url and not should_notify:
-        print("discord notification: skipped (no new items)")
-    else:
-        print("discord notification: skipped (webhook url is empty)")
+        state["windows"]["release_health"] = current_snapshot
+        state["windows"]["latest_evaluation"] = evaluation
+        save_json(STATE_PATH, state)
 
-    state["windows"]["release_health"] = current_snapshot
-    state["windows"]["latest_evaluation"] = evaluation
-    save_json(STATE_PATH, state)
-
-    print("saved latest evaluation to state.json")
+        print("saved latest evaluation to state.json")
+        print()
     print()
 
     print("[nvidia]")
     print(settings["nvidia"])
     print()
 
-    nvidia_result = fetch_nvidia_drivers_page()
-    nvidia_html = nvidia_result["html"]
-    nvidia_news_items = parse_nvidia_driver_news_items(nvidia_html)
-
-    previous_nvidia_snapshot = state.get("nvidia", {}).get("driver_news", {})
-    previous_nvidia_items = previous_nvidia_snapshot.get("items", [])
-
-    added_nvidia_items = get_added_news_items(previous_nvidia_items, nvidia_news_items)
-    has_previous_nvidia_snapshot = bool(previous_nvidia_snapshot)
-    has_new_nvidia_items = bool(added_nvidia_items)
-    should_notify_nvidia = (not has_previous_nvidia_snapshot) or has_new_nvidia_items
-
-    print("nvidia fetch result:")
-    print(f"url: {nvidia_result['url']}")
-    print(f"html_length: {len(nvidia_html)}")
-    print()
-
-    print("current nvidia driver news items:")
-    if nvidia_news_items:
-        for item in nvidia_news_items[:5]:
-            print(f"- {item['published_at']} | {item['title']}")
+    if not settings.get("nvidia", {}).get("enabled", True):
+        print("nvidia check: skipped (disabled)")
+        print()
     else:
-        print("- none")
-    print()
+        nvidia_result = fetch_nvidia_drivers_page()
+        nvidia_html = nvidia_result["html"]
+        nvidia_news_items = parse_nvidia_driver_news_items(nvidia_html)
 
-    if not has_previous_nvidia_snapshot:
-        print("previous nvidia snapshot: none")
-        print("nvidia result: first save")
-    else:
-        print("previous nvidia snapshot: found")
-        if has_new_nvidia_items:
-            print("nvidia result: new items found")
+        previous_nvidia_snapshot = state.get("nvidia", {}).get("driver_news", {})
+        previous_nvidia_items = previous_nvidia_snapshot.get("items", [])
+
+        added_nvidia_items = get_added_news_items(previous_nvidia_items, nvidia_news_items)
+        has_previous_nvidia_snapshot = bool(previous_nvidia_snapshot)
+        has_new_nvidia_items = bool(added_nvidia_items)
+        should_notify_nvidia = (not has_previous_nvidia_snapshot) or has_new_nvidia_items
+
+        print("nvidia fetch result:")
+        print(f"url: {nvidia_result['url']}")
+        print(f"html_length: {len(nvidia_html)}")
+        print()
+
+        print("current nvidia driver news items:")
+        if nvidia_news_items:
+            for item in nvidia_news_items[:5]:
+                print(f"- {item['published_at']} | {item['title']}")
         else:
-            print("nvidia result: no new items")
-    print()
+            print("- none")
+        print()
 
-    print("new nvidia driver news items:")
-    if added_nvidia_items:
-        for item in added_nvidia_items:
-            print(f"- {item['published_at']} | {item['title']}")
-    else:
-        print("- none")
-    print()
+        if not has_previous_nvidia_snapshot:
+            print("previous nvidia snapshot: none")
+            print("nvidia result: first save")
+        else:
+            print("previous nvidia snapshot: found")
+            if has_new_nvidia_items:
+                print("nvidia result: new items found")
+            else:
+                print("nvidia result: no new items")
+        print()
 
-    state["nvidia"]["driver_news"] = {
-        "items": nvidia_news_items
-    }
-    save_json(STATE_PATH, state)
+        print("new nvidia driver news items:")
+        if added_nvidia_items:
+            for item in added_nvidia_items:
+                print(f"- {item['published_at']} | {item['title']}")
+        else:
+            print("- none")
+        print()
 
-    nvidia_evaluation = evaluate_nvidia_driver_news(nvidia_news_items)
+        state["nvidia"]["driver_news"] = {
+            "items": nvidia_news_items
+        }
+        save_json(STATE_PATH, state)
 
-    print("nvidia evaluation:")
-    print(f"verdict: {nvidia_evaluation['verdict']}")
-    print(f"latest: {nvidia_evaluation['latest_published_at']} | {nvidia_evaluation['latest_title']}")
-    print("reasons:")
-    for reason in nvidia_evaluation["reasons"]:
-        print(f"- {reason}")
-    print()
+        nvidia_evaluation = evaluate_nvidia_driver_news(nvidia_news_items)
 
-    nvidia_message = build_nvidia_message(nvidia_news_items, nvidia_evaluation)
+        print("nvidia evaluation:")
+        print(f"verdict: {nvidia_evaluation['verdict']}")
+        print(f"latest: {nvidia_evaluation['latest_published_at']} | {nvidia_evaluation['latest_title']}")
+        print("reasons:")
+        for reason in nvidia_evaluation["reasons"]:
+            print(f"- {reason}")
+        print()
 
-    print("nvidia notification preview:")
-    print(nvidia_message)
-    print()
+        nvidia_message = build_nvidia_message(nvidia_news_items, nvidia_evaluation)
 
-    if webhook_url and should_notify_nvidia:
-        send_discord_message(webhook_url, nvidia_message)
-        print("nvidia discord notification: sent")
-    elif webhook_url and not should_notify_nvidia:
-        print("nvidia discord notification: skipped (no new items)")
-    else:
-        print("nvidia discord notification: skipped (webhook url is empty)")
-    print()
+        print("nvidia notification preview:")
+        print(nvidia_message)
+        print()
 
-    state["nvidia"]["latest_evaluation"] = nvidia_evaluation
-    save_json(STATE_PATH, state)
+        if webhook_url and should_notify_nvidia:
+            send_discord_message(webhook_url, nvidia_message)
+            print("nvidia discord notification: sent")
+        elif webhook_url and not should_notify_nvidia:
+            print("nvidia discord notification: skipped (no new items)")
+        else:
+            print("nvidia discord notification: skipped (webhook url is empty)")
+        print()
 
-    print("saved nvidia snapshot to state.json")
+        state["nvidia"]["latest_evaluation"] = nvidia_evaluation
+        save_json(STATE_PATH, state)
+
+        print("saved nvidia snapshot to state.json")
+        print()
 
     print()
     print("[ios]")
     print(settings.get("ios", {}))
     print()
+
+    if not settings.get("ios", {}).get("enabled", True):
+        print("ios check: skipped (disabled)")
+        return
 
     ios_result = fetch_ios_updates_page()
     ios_html = ios_result["html"]
@@ -289,6 +313,17 @@ def main() -> None:
     print(f"status: {ios_result['status_code']}")
     print(f"title: {ios_title}")
     print(f"html_length: {len(ios_html)}")
+    print()
+
+    security_result = fetch_apple_security_releases_page()
+    security_html = security_result["html"]
+    security_title = parse_ios_page_title(security_html)
+
+    print("apple security releases fetch result:")
+    print(f"url: {security_result['url']}")
+    print(f"status: {security_result['status_code']}")
+    print(f"title: {security_title}")
+    print(f"html_length: {len(security_html)}")
     print()
 
     if not has_previous_ios_snapshot:
