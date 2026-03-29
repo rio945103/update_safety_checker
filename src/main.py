@@ -1,20 +1,43 @@
 from pathlib import Path
 import json
+import requests
 
 from fetchers.windows_fetcher import fetch_windows_release_health
+from fetchers.nvidia_fetcher import fetch_nvidia_drivers_page
 from parsers.windows_parser import (
     parse_html_title,
     parse_message_center_items,
     parse_windows_versions,
 )
+from parsers.nvidia_parser import parse_nvidia_driver_news_items
+from parsers.ios_parser import parse_ios_page_title, parse_ios_update_versions
 from evaluators.windows_evaluator import evaluate_windows_release_health
-from notifiers.discord_notifier import build_windows_message, send_discord_message
+from evaluators.nvidia_evaluator import evaluate_nvidia_driver_news
+from evaluators.ios_evaluator import evaluate_ios_updates
+from notifiers.discord_notifier import (
+    build_windows_message,
+    build_nvidia_message,
+    build_ios_message,
+    send_discord_message,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_PATH = BASE_DIR / "config" / "settings.json"
 STATE_PATH = BASE_DIR / "data" / "state.json"
 
+IOS_UPDATES_URL = "https://support.apple.com/en-us/123075"
+
+
+def fetch_ios_updates_page() -> dict:
+    response = requests.get(IOS_UPDATES_URL, timeout=20)
+    response.raise_for_status()
+
+    return {
+        "url": IOS_UPDATES_URL,
+        "status_code": response.status_code,
+        "html": response.text,
+    }
 
 def load_json(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
@@ -48,6 +71,19 @@ def get_added_items(old_items: list[str], new_items: list[str]) -> list[str]:
     old_set = set(old_items)
     return [item for item in new_items if item not in old_set]
 
+def get_added_news_items(old_items: list[dict], new_items: list[dict]) -> list[dict]:
+    old_keys = {
+        (item.get("published_at", ""), item.get("title", ""))
+        for item in old_items
+    }
+
+    added = []
+    for item in new_items:
+        key = (item.get("published_at", ""), item.get("title", ""))
+        if key not in old_keys:
+            added.append(item)
+
+    return added
 
 def main() -> None:
     settings = load_json(SETTINGS_PATH)
@@ -142,7 +178,185 @@ def main() -> None:
     save_json(STATE_PATH, state)
 
     print("saved latest evaluation to state.json")
+    print()
 
+    print("[nvidia]")
+    print(settings["nvidia"])
+    print()
+
+    nvidia_result = fetch_nvidia_drivers_page()
+    nvidia_html = nvidia_result["html"]
+    nvidia_news_items = parse_nvidia_driver_news_items(nvidia_html)
+
+    previous_nvidia_snapshot = state.get("nvidia", {}).get("driver_news", {})
+    previous_nvidia_items = previous_nvidia_snapshot.get("items", [])
+
+    added_nvidia_items = get_added_news_items(previous_nvidia_items, nvidia_news_items)
+    has_previous_nvidia_snapshot = bool(previous_nvidia_snapshot)
+    has_new_nvidia_items = bool(added_nvidia_items)
+    should_notify_nvidia = (not has_previous_nvidia_snapshot) or has_new_nvidia_items
+
+    print("nvidia fetch result:")
+    print(f"url: {nvidia_result['url']}")
+    print(f"html_length: {len(nvidia_html)}")
+    print()
+
+    print("current nvidia driver news items:")
+    if nvidia_news_items:
+        for item in nvidia_news_items[:5]:
+            print(f"- {item['published_at']} | {item['title']}")
+    else:
+        print("- none")
+    print()
+
+    if not has_previous_nvidia_snapshot:
+        print("previous nvidia snapshot: none")
+        print("nvidia result: first save")
+    else:
+        print("previous nvidia snapshot: found")
+        if has_new_nvidia_items:
+            print("nvidia result: new items found")
+        else:
+            print("nvidia result: no new items")
+    print()
+
+    print("new nvidia driver news items:")
+    if added_nvidia_items:
+        for item in added_nvidia_items:
+            print(f"- {item['published_at']} | {item['title']}")
+    else:
+        print("- none")
+    print()
+
+    state["nvidia"]["driver_news"] = {
+        "items": nvidia_news_items
+    }
+    save_json(STATE_PATH, state)
+
+    nvidia_evaluation = evaluate_nvidia_driver_news(nvidia_news_items)
+
+    print("nvidia evaluation:")
+    print(f"verdict: {nvidia_evaluation['verdict']}")
+    print(f"latest: {nvidia_evaluation['latest_published_at']} | {nvidia_evaluation['latest_title']}")
+    print("reasons:")
+    for reason in nvidia_evaluation["reasons"]:
+        print(f"- {reason}")
+    print()
+
+    nvidia_message = build_nvidia_message(nvidia_news_items, nvidia_evaluation)
+
+    print("nvidia notification preview:")
+    print(nvidia_message)
+    print()
+
+    if webhook_url and should_notify_nvidia:
+        send_discord_message(webhook_url, nvidia_message)
+        print("nvidia discord notification: sent")
+    elif webhook_url and not should_notify_nvidia:
+        print("nvidia discord notification: skipped (no new items)")
+    else:
+        print("nvidia discord notification: skipped (webhook url is empty)")
+    print()
+
+    state["nvidia"]["latest_evaluation"] = nvidia_evaluation
+    save_json(STATE_PATH, state)
+
+    print("saved nvidia snapshot to state.json")
+
+    print()
+    print("[ios]")
+    print(settings.get("ios", {}))
+    print()
+
+    ios_result = fetch_ios_updates_page()
+    ios_html = ios_result["html"]
+    ios_title = parse_ios_page_title(ios_html)
+    ios_versions = parse_ios_update_versions(ios_html)
+
+    previous_ios_snapshot = state.get("ios", {}).get("updates", {})
+    added_ios_versions = get_added_items(
+        previous_ios_snapshot.get("versions", []),
+        ios_versions,
+    )
+
+    has_previous_ios_snapshot = bool(previous_ios_snapshot)
+    has_new_ios_versions = bool(added_ios_versions)
+
+    should_notify_ios = (not has_previous_ios_snapshot) or has_new_ios_versions
+
+    print("ios fetch result:")
+    print(f"url: {ios_result['url']}")
+    print(f"status: {ios_result['status_code']}")
+    print(f"title: {ios_title}")
+    print(f"html_length: {len(ios_html)}")
+    print()
+
+    if not has_previous_ios_snapshot:
+        print("previous ios snapshot: none")
+        print("ios result: first save")
+    else:
+        print("previous ios snapshot: found")
+        if has_new_ios_versions:
+            print("ios result: new items found")
+        else:
+            print("ios result: no new items")
+    print()
+
+    print("new ios versions:")
+    if added_ios_versions:
+        for version in added_ios_versions:
+            print(f"- {version}")
+    else:
+        print("- none")
+    print()
+
+    print("current ios versions:")
+    if ios_versions:
+        for version in ios_versions[:10]:
+            print(f"- {version}")
+    else:
+        print("- none")
+    print()
+
+    ios_evaluation = evaluate_ios_updates(ios_versions)
+
+    print("ios evaluation:")
+    print(f"verdict: {ios_evaluation['verdict']}")
+    print(f"latest: {ios_evaluation['latest_version']}")
+    print("reasons:")
+    for reason in ios_evaluation["reasons"]:
+        print(f"- {reason}")
+    print()
+
+    state["ios"]["updates"] = {
+        "title": ios_title,
+        "versions": ios_versions,
+    }
+    state["ios"]["latest_evaluation"] = ios_evaluation
+    save_json(STATE_PATH, state)
+
+    ios_message = build_ios_message(
+        {
+            "title": ios_title,
+            "versions": ios_versions,
+        },
+        ios_evaluation,
+    )
+
+    print("ios notification preview:")
+    print(ios_message)
+    print()
+
+    if webhook_url and should_notify_ios:
+        send_discord_message(webhook_url, ios_message)
+        print("ios discord notification: sent")
+    elif webhook_url and not should_notify_ios:
+        print("ios discord notification: skipped (no new items)")
+    else:
+        print("ios discord notification: skipped (webhook url is empty)")
+    print()
+
+    print("saved ios snapshot to state.json")
 
 if __name__ == "__main__":
     main()
