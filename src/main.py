@@ -21,6 +21,10 @@ from notifiers.discord_notifier import (
     send_discord_message,
 )
 
+from fetchers.windows_local_fetcher import fetch_local_windows_updates
+from evaluators.windows_local_evaluator import evaluate_local_windows_updates
+from notifiers.discord_notifier import build_windows_local_message
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_PATH = BASE_DIR / "config" / "settings.json"
@@ -194,6 +198,46 @@ def main() -> None:
 
             print("saved latest evaluation to state.json")
             print()
+
+            try:
+                local_updates = fetch_local_windows_updates()
+                local_evaluation = evaluate_local_windows_updates(local_updates)
+
+                print("local updates:")
+                if local_updates:
+                    for u in local_updates:
+                        print(f"- {u['KB']} | {u['Title']} | {u['Size']}")
+                else:
+                    print("- none")
+                print()
+
+                print("local evaluation:")
+                print(f"verdict: {local_evaluation['verdict']}")
+                print("reasons:")
+                for reason in local_evaluation["reasons"]:
+                    print(f"- {reason}")
+                print()
+
+                local_message = build_windows_local_message(local_evaluation)
+                print("local notification preview:")
+                print(local_message)
+                print()
+
+                if webhook_url:
+                    send_discord_message(webhook_url, local_message)
+                    print("windows local discord notification: sent")
+                else:
+                    print("windows local discord notification: skipped (webhook url is empty)")
+                print()
+
+                state["windows"]["local_updates"] = local_evaluation
+                save_json(STATE_PATH, state)
+                print("saved local updates evaluation to state.json")
+                print()
+
+            except Exception as e:
+                print(f"windows local check: error ({e})")
+                print()
 
         except Exception as e:
             print(f"windows check: error ({e})")
